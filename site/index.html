@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="115年全民運動會高雄選手賽程、姓名、晉級與決賽成績查詢。依官方公開資料更新。">
+  <meta name="theme-color" content="#102c2a">
+  <title>高雄上場｜115全民運選手追蹤</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23102c2a'/%3E%3Cpath d='M8 7v18m2-9L23 7M10 16l13 9' stroke='%23d7f75b' stroke-width='4' fill='none'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="./styles.css">
+  <script src="./data/snapshot.js" defer></script>
+  <script src="./data/documents.js" defer></script>
+  <script src="./app.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">跳到查詢結果</a>
+<header class="topbar"><div class="brand"><span class="brand-mark" aria-hidden="true">K</span><div><strong>高雄上場</strong><span>115 全民運動會 · TAOYUAN 2026</span></div></div><a class="official" href="https://sport115.tycg.gov.tw/Module/Home/Index.php" target="_blank" rel="noopener noreferrer">大會官網 ↗</a></header>
+<main id="main">
+  <section class="intro"><div><p class="eyebrow">TEAM KAOHSIUNG</p><h1>今天，誰上場？</h1><p id="intro-note">查選手、看賽程，追蹤每一次晉級。</p></div><div class="update"><span id="updated-at" role="status">正在讀取官方資料…</span><button id="refresh" class="button subtle" type="button">↻ 檢查更新</button></div></section>
+  <div id="data-notice" class="notice" hidden></div>
+  <section id="stats" class="stats" aria-label="高雄參賽摘要"></section>
+  <nav class="tabs" aria-label="查詢分類"><button data-view="schedule" class="active" aria-current="page">比賽日程</button><button data-view="athletes">高雄選手</button><button data-view="finals">決賽與名次</button><button data-view="sports">全部競賽種類</button></nav>
+  <section class="filters" aria-label="查詢條件"><label class="search"><span>搜尋姓名、項目</span><input id="search" type="search" placeholder="例如：王立淳、滑輪溜冰" autocomplete="off"></label><label><span>競賽種類</span><select id="sport-filter"><option value="">全部種類</option></select></label><label id="status-filter-wrap"><span>賽事狀態</span><select id="status-filter"><option value="">全部狀態</option><option value="result">已有成績</option><option value="final">決賽場次</option><option value="pending">待確認／待公告</option></select></label><button id="clear" class="button subtle" type="button">清除條件</button></section>
+  <section id="date-controls" class="date-controls" aria-label="選擇比賽日期"><div class="date-toolbar"><button id="today" class="button" type="button">今天</button><button id="all-dates" class="button subtle" type="button">全部日期</button><label class="date-picker">指定日期 <input id="date-picker" type="date" min="2026-08-01" max="2026-10-31"></label></div><div id="date-strip" class="date-strip"></div></section>
+  <div class="result-heading"><div><h2 id="result-title">高雄選手賽程</h2><p id="result-summary" aria-live="polite"></p></div><button id="export" class="button subtle" type="button">匯出目前結果 CSV ↓</button></div>
+  <div id="results" aria-busy="true"><div class="empty">正在整理賽程…</div></div>
+  <footer><p>資料來源：<a href="https://sport115.tycg.gov.tw/Module/Home/Index.php" target="_blank" rel="noopener noreferrer">115年全民運動會官方網站</a>。本站為高雄選手查詢工具，非大會官方網站。時間皆為臺灣時間。</p><p>依官方公告同步，並非逐秒直播。團體名單是報名選手，不代表每場實際出賽；未公告結果不等於未晉級。</p><details><summary>資料更新與判讀方式</summary><div id="source-notes"></div></details></footer>
+</main>
+<dialog id="athlete-dialog" aria-labelledby="dialog-title"><div class="dialog-header"><div><p class="eyebrow">TEAM KAOHSIUNG</p><h2 id="dialog-title"></h2></div><button id="close-dialog" class="button subtle" type="button" aria-label="關閉詳細資料">✕</button></div><div id="dialog-content"></div></dialog>
+<noscript>請開啟瀏覽器的 JavaScript，以使用選手與日期查詢。</noscript>
+</body>
+</html>
