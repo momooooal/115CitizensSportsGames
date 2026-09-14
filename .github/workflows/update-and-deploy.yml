@@ -1,0 +1,110 @@
+name: 更新高雄賽事並發布網站
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      full:
+        description: '同時重新讀取全市名單與全部 PDF（較慢）'
+        type: boolean
+        default: false
+  schedule:
+    # UTC；避開整點。賽會期間每 10 分鐘提出更新，GitHub 可能延後執行。
+    - cron: '3,13,23,33,43,53 * * 9,10 *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sport115-pages
+  cancel-in-progress: false
+
+jobs:
+  season:
+    runs-on: ubuntu-latest
+    outputs:
+      active: ${{ steps.check.outputs.active }}
+    steps:
+      - id: check
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" != "schedule" ] || [ "$(date -u +%Y)" = "2026" ]; then
+            echo 'active=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'active=false' >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: season
+    if: needs.season.outputs.active == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: write
+      pages: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref_name }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: 安裝資料整理套件
+        run: python -m pip install -r requirements.txt
+      - name: 還原歷史賽程快取
+        uses: actions/cache@v5
+        with:
+          path: .cache
+          key: sport115-html-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: sport115-html-v1-
+      - name: 更新官方資料（失敗時保留舊資料並顯示提醒）
+        id: sync
+        continue-on-error: true
+        env:
+          FULL_REFRESH: ${{ inputs.full }}
+        run: |
+          if [ "$FULL_REFRESH" = "true" ]; then
+            python scripts/update.py --full
+          else
+            python scripts/update.py
+          fi
+      - name: 驗證資料與查詢邏輯
+        run: |
+          python -m unittest discover -s tests -p 'test_*.py'
+          node --test tests/app.test.cjs
+          node --check site/app.js
+      - name: 保存本次資料與同步狀態
+        run: |
+          git add site/data
+          if ! git diff --cached --quiet; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git commit -m '更新官方賽事資料與同步狀態'
+            git push
+          fi
+      - name: 設定 GitHub Pages
+        uses: actions/configure-pages@v5
+      - name: 上傳網站
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+      - name: 記錄更新結果
+        if: steps.sync.outcome == 'failure'
+        run: echo '::warning::本次官網同步失敗；網站將顯示上次成功資料及更新提醒。'
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: 發布網站
+        id: deployment
+        uses: actions/deploy-pages@v4
