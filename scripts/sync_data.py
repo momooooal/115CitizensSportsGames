@@ -212,7 +212,9 @@ def parse_schedule(doc,sid,sport,url):
 
 def parse_entry(doc,pid,sid,sport,url):
     event=options(doc,'PID').get(pid,'');names=[];appearances=[]
-    for t in table_rows(doc,['姓名','日期']):
+    tables=list(table_rows(doc,['姓名','日期']))
+    published=any(cells(row) and clean(cells(row)[0]) and not re.search(r'查無|尚未|無資料',clean(cells(row)[0])) for t in tables for row in t.xpath('.//tr[td]'))
+    for t in tables:
         labels=t.getparent().xpath('./span/text()')
         if not any(CITY in clean(label) for label in labels):continue
         for row in t.xpath('.//tr[td]'):
@@ -223,7 +225,7 @@ def parse_entry(doc,pid,sid,sport,url):
                 for a in row.xpath('.//a[contains(@href,"InstantScore.php")]'):
                     fid=parse_qs(urlsplit(a.get('href')).query).get('FID',[None])[0]
                     if fid:appearances.append({'name':name,'fid':fid,'text':clean(a)})
-    return {'pid':pid,'sport_id':sid,'sport':sport,'title':sport+event,'names':names,'appearances':appearances,'source':url}
+    return {'pid':pid,'sport_id':sid,'sport':sport,'title':sport+event,'names':names,'appearances':appearances,'roster_published':bool(published),'source':url}
 
 def parse_score(doc,event,url):
     """Return confirmed Kaohsiung rows and an explicit report coverage flag."""
@@ -470,7 +472,7 @@ def run(args):
         if not duplicate:records.append(event)
     records.sort(key=lambda r:(r['date'],r.get('time') or '99:99',r['sport_id'],r['title'],r['id']))
     athletes=attach_athletes(registrations,entries,records,finals,sport_map)
-    data={'schema_version':1,'sports':[{'id':sid,'name':name} for sid,name in sport_map.items()],'registrations':registrations,'athletes':athletes,'entries':entries,'events':records,'finals':finals,'plans':plans,'resources':resources,'documents':docs,
+    data={'schema_version':1,'sports':[{'id':sid,'name':name} for sid,name in sport_map.items()],'registrations':registrations,'athletes':athletes,'entries':entries,'events':records,'scheduled_sessions':schedule,'finals':finals,'plans':plans,'resources':resources,'documents':docs,
           'meta':{'checked_at':max(fetcher.observed.values()) if args.offline else datetime.now(timezone.utc).isoformat(),'reference_checked_at':reference_checked_at,'timezone':'Asia/Taipei','documents_checked_at':supplements.get('checked_at'),'schedule_sport_ids':list(schedule_urls),'pdf_event_count':len(pdf_events),'official_schedule_count':len(schedule),'unrecognized_reports':unrecognized,'source_count':len(fetcher.observed),'sources':SOURCES,'source_checks':fetcher.observed,'update_interval_minutes':10,'status':'ok','snapshot_note':'資料依官方已公開名單、賽程、成績與附件整理；精確場次與種類期間分開呈現。'}}
     write_snapshot(data,args.output)
     (args.output/'sync-status.json').write_text(json.dumps({'status':'ok','attempted_at':now.isoformat(),'last_success_at':now.isoformat()},ensure_ascii=False))

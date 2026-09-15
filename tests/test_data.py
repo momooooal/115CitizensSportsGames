@@ -12,7 +12,7 @@ from lxml import html
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
-from sync_data import parse_score, join_events, validate_snapshot, Fetcher, cache_key
+from sync_data import parse_score, parse_entry, join_events, validate_snapshot, Fetcher, cache_key
 from update import update
 
 
@@ -24,6 +24,14 @@ def event(phase='預賽'):
 
 
 class ScoreInterpretation(unittest.TestCase):
+    def test_distinguishes_unpublished_roster_from_published_roster_without_kaohsiung(self):
+        template='<div><span>臺北市</span><table><tr><th>姓名</th><th>日期</th></tr>{}</table></div>'
+        empty=parse_entry(html.fromstring(template.format('')),'item','303','滑輪溜冰','https://sport115.tycg.gov.tw/')
+        published=parse_entry(html.fromstring(template.format('<tr><td>測試選手</td></tr>')),'item','303','滑輪溜冰','https://sport115.tycg.gov.tw/')
+        self.assertFalse(empty['roster_published'])
+        self.assertTrue(published['roster_published'])
+        self.assertEqual(published['names'],[])
+
     def test_historical_cache_keeps_original_timestamp_but_live_requests_refresh(self):
         url = 'https://sport115.tycg.gov.tw/Module/Score/InstantScore.php?FID=fixture'
         with tempfile.TemporaryDirectory() as temporary:

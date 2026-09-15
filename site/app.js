@@ -14,6 +14,63 @@
     if (event.opponent && event.score_order === '高雄在後' && /^\d+[:：]\d+$/.test(event.score || '')) return event.score.split(/[:：]/).reverse().join(' : ');
     return String(event.score || '').replace(/^([0-9]+)[:：]([0-9]+)$/, '$1 : $2');
   };
+  const isPendingSchedule = event => ['period','session'].includes(event.schedule_scope);
+  const timeScopeLabel = event => event.schedule_scope==='session'?'項目表定時間':event.time_scope==='event'?'項目開始':event.time_scope==='match'?'表定時間':'個別出賽時間';
+  function registeredNames(snapshot,sportId,label='') {
+    let rows=(snapshot.registrations||[]).filter(r=>r.sport_id===sportId);
+    const disciplines={303:['曲棍球','花式','競速'],306:['室內','室外'],327:['自由潛水','蹼泳'],309:['爭奪','高爾夫'],329:['競技','競速','花式'],134:['指定推手對練','推手','套路']};
+    const discipline=(disciplines[sportId]||[]).find(word=>label.includes(word));
+    if(discipline&&rows.some(r=>(disciplines[sportId]||[]).some(word=>r.group.includes(word))))rows=rows.filter(r=>r.group.includes(discipline));
+    const genderListed=rows.some(r=>/男子|女子/.test(r.group));
+    if(genderListed&&label.includes('男子')&&!label.includes('女子'))rows=rows.filter(r=>r.group.includes('男子'));
+    if(genderListed&&label.includes('女子')&&!label.includes('男子'))rows=rows.filter(r=>r.group.includes('女子'));
+    return [...new Set(rows.map(r=>r.name))];
+  }
+  function buildScheduleItems(snapshot) {
+    const base=snapshot.events||[], added=[];
+    const sameItem=(a,b)=>{
+      if(a.sport_id!==b.sport_id||a.date!==b.date)return false;
+      if(a.fid&&b.fid)return a.fid===b.fid;
+      const teamDay=/團體賽|曲棍球/.test(b.title);
+      if((a.phase||'')!==(b.phase||'')&&!(teamDay&&(!a.phase||!b.phase)))return false;
+      if(a.pid&&b.pid&&a.pid===b.pid)return true;
+      return normalize(a.title).replace(/[（(].*?[)）]/g,'')===normalize(b.title).replace(/[（(].*?[)）]/g,'');
+    };
+    const pending=(fields)=>({names_basis:'group_registration',time:null,time_scope:'unknown',phase:'',opponent:'',score:'',rank:null,round_rank:null,advancement:null,result_state:'entry_pending',links:[],note:'',...fields});
+    // Keep the official session even when no named Kaohsiung appearance exists.
+    for(const session of snapshot.scheduled_sessions||[]) {
+      if(base.some(e=>sameItem(e,session)))continue;
+      const entry=(snapshot.entries||[]).find(e=>e.pid===session.pid&&e.sport_id===session.sport_id);
+      if(entry?.roster_published&&!entry.names.length)continue;
+      let names=entry?.names?.length?[...new Set(entry.names)]:registeredNames(snapshot,session.sport_id,session.title);
+      if(session.phase==='決賽')names=names.filter(name=>!base.some(e=>e.sport_id===session.sport_id&&e.pid===session.pid&&e.advancement==='not_qualified'&&e.names.includes(name)));
+      if(!names.length)continue;
+      added.push(pending({...session,id:'pending-session-'+session.id,names,
+        names_basis:entry?.names?.length?'item_registration':'group_registration',
+        time_scope:session.time?'event':'unknown',schedule_scope:'session',
+        result_state:['決賽','準決賽','複賽'].includes(session.phase)?'conditional':'entry_pending',
+        report:null,source:session.source,
+        note:'高雄選手實際出賽時間待公布／確認；本場出賽名單待公布／確認。'}));
+    }
+    // Daily period entries are registration references, never attendance claims.
+    for(const plan of snapshot.plans||[]) {
+      if(plan.discipline.includes('資格賽'))continue; // Main-meet entries do not prove qualifier attendance.
+      const names=registeredNames(snapshot,plan.sport_id,plan.discipline);
+      if(!names.length)continue;
+      const start=new Date(plan.start+'T00:00:00Z'), end=new Date(plan.end+'T00:00:00Z');
+      if(Number.isNaN(+start)||Number.isNaN(+end)||end<start||end-start>366*86400000)continue;
+      for(let stamp=+start;stamp<=+end;stamp+=86400000) {
+        const day=new Date(stamp).toISOString().slice(0,10);
+        const covered=new Set([...base,...added].filter(e=>e.sport_id===plan.sport_id&&e.date===day&&e.schedule_scope!=='period').flatMap(e=>e.names));
+        if(names.every(name=>covered.has(name)))continue;
+        added.push(pending({id:'pending-period-'+plan.id+'-'+day,sport_id:plan.sport_id,sport:plan.sport,
+          date:day,title:plan.discipline+'｜競賽期間',names,names_basis:'group_registration',
+          schedule_scope:'period',venue:plan.venue,source:plan.source,plan_id:plan.id,
+          note:'高雄選手實際出賽時間待公布／確認。此日位於官方競賽期間，名單為報名選手，不代表每位選手當天都會出賽。'}));
+      }
+    }
+    return [...base,...added].sort((a,b)=>a.date.localeCompare(b.date)||(a.time||'99:99').localeCompare(b.time||'99:99')||a.sport_id.localeCompare(b.sport_id)||a.title.localeCompare(b.title)||a.id.localeCompare(b.id));
+  }
   const statusInfo = (event, now=new Date()) => {
     if (event.rank) return {text:`決賽第 ${event.rank} 名`,tone:event.rank===1?'gold':event.rank===2?'silver':event.rank===3?'bronze':'confirmed'};
     if (event.advancement==='qualified') return {text:'已確認晉級決賽',tone:'confirmed'};
@@ -23,14 +80,15 @@
     if (event.result_state==='draw') return {text:'本場平手',tone:''};
     if (event.result_state==='result') return {text:'已有成績',tone:'confirmed'};
     if (event.result_state==='conditional') return {text:'晉級待確認',tone:'pending'};
+    if (isPendingSchedule(event)) return {text:'個別出賽待確認',tone:'pending'};
     if (event.date < taipeiDay(now) || (event.time && new Date(`${event.date}T${event.time}:00+08:00`) < now)) return {text:'待官方更新',tone:'pending'};
     return {text:'賽程已排',tone:''};
   };
   const csvCell = value => '"' + String(value ?? '').replace(/^[=+@-]/, c=>"'"+c).replace(/"/g,'""') + '"';
-  if (typeof module !== 'undefined' && module.exports) {module.exports={matches,taipeiDay,statusInfo,scoreLabel,csvCell,safeUrl};return;}
+  if (typeof module !== 'undefined' && module.exports) {module.exports={matches,taipeiDay,statusInfo,scoreLabel,csvCell,safeUrl,buildScheduleItems,registeredNames,isPendingSchedule,timeScopeLabel};return;}
   const $ = id => document.getElementById(id);
   const downloadMode=location.protocol==='file:' || document.documentElement.dataset.preview==='true';
-  const nameBasisLabel={team_entry:'隊伍報名名單',team_registration:'隊伍報名名單',registration:'項目報名選手',report:'成績報告所列選手',entry_round:'本輪名單',pdf_roster:'官方賽程所列選手'};
+  const nameBasisLabel={team_entry:'隊伍報名名單',team_registration:'隊伍報名名單',registration:'項目報名選手',report:'成績報告所列選手',entry_round:'本輪名單',pdf_roster:'官方賽程所列選手',item_registration:'項目報名名單，個別出賽待確認',group_registration:'高雄相關組別報名名單，個別出賽待確認'};
   let data=window.SPORT115_DATA;
   let docs=window.SPORT115_DOCUMENTS || {documents:[]};
   let state={view:'schedule',query:'',sport:'',status:'',day:taipeiDay(),page:1};
@@ -41,13 +99,17 @@
   let athleteMap=new Map();
   let eventMap=new Map();
   let finalMap=new Map();
+  let calendarItems=[];
+  let athleteCalendar=new Map();
   function indexData(){
     athleteMap=new Map(data.athletes.map(a=>[`${a.sport_id}|${a.name}`,a]));
     eventMap=new Map(data.events.map(e=>[e.id,e]));finalMap=new Map(data.finals.map(f=>[f.id,f]));
+    calendarItems=buildScheduleItems(data);athleteCalendar=new Map();
+    for(const event of calendarItems)for(const name of event.names){const key=`${event.sport_id}|${name}`;if(!athleteCalendar.has(key))athleteCalendar.set(key,[]);athleteCalendar.get(key).push(event);}
   }
   function namesMarkup(names,sportId,basis='') {
     const buttons=names.map(name=>{const athlete=athleteMap.get(`${sportId}|${name}`);return athlete?`<button type="button" class="name-button" data-athlete="${esc(athlete.id)}">${esc(name)}</button>`:`<span>${esc(name)}</span>`;});
-    const note=basis==='team_entry'||basis==='team_registration'?'隊伍報名名單；實際出賽以大會紀錄為準':basis==='registration'?'項目報名選手':basis==='report'?'成績報告所列選手':basis==='entry_round'?'本輪名單':basis==='pdf_roster'?'官方賽程所列選手':'';
+    const note=basis==='team_entry'||basis==='team_registration'?'隊伍報名名單；實際出賽以大會紀錄為準':basis==='registration'?'項目報名選手':basis==='report'?'成績報告所列選手':basis==='entry_round'?'本輪名單':basis==='pdf_roster'?'官方賽程所列選手':basis==='group_registration'||basis==='item_registration'?'高雄報名選手名單；本場實際出賽人員待公布／確認':'';
     if(names.length<=4) return `<div class="names">${buttons.join('')}</div>${note?`<p class="small" style="margin-top:7px">${esc(note)}</p>`:''}`;
     const queryMatches=state.query && names.some(n=>matches(n,state.query));
     return `<div class="names">${buttons.slice(0,3).join('')}</div><details class="roster-details" ${queryMatches?'open':''}><summary>完整名單 · ${names.length} 位選手</summary><div class="names">${buttons.join('')}</div><p>${esc(note)}</p></details>`;
@@ -60,11 +122,11 @@
   function eventCard(event, compact=false) {
     const info=statusInfo(event);
     const title=event.title.startsWith(event.sport)?event.title.slice(event.sport.length):event.title;
-    const timeScope=event.time_scope==='event'?'項目開始':event.time_scope==='match'?'表定時間':'個別時間待確認';
+    const timeScope=timeScopeLabel(event);
     const venue=event.venue || venueFor(event);
-    const detail=event.result_state==='conditional'?'以下為此項目報名名單，尚未確認誰進入本輪。':event.advancement_basis || '';
+    const detail=isPendingSchedule(event)?(event.schedule_scope==='period'?'高雄相關組別報名選手：':'項目賽程已排定，本場高雄出賽名單待公布／確認。')+(event.result_state==='conditional'?' 尚未確認晉級本輪名單。':''):event.result_state==='conditional'?'以下為此項目報名名單，尚未確認誰進入本輪。':event.advancement_basis || '';
     const result=scoreLabel(event);
-    return `<article class="event-card"><div class="event-time"><strong>${esc(event.time || '待定')}</strong><span>${esc(timeScope)}</span>${compact?`<span>${shortDate(event.date)} ${weekday(event.date)}</span>`:''}</div><div class="event-main"><div class="event-meta"><span class="sport-tag">${esc(event.sport)}</span>${event.phase?`<span>／ ${esc(event.phase)}</span>`:''}${event.match_no?`<span>第 ${esc(event.match_no)} 場</span>`:''}</div><h3>${esc(title)}</h3>${event.opponent?`<p style="margin-top:5px"><strong>高雄市</strong> <span class="small">vs</span> ${esc(event.opponent)}</p>`:''}${detail?`<p class="small" style="margin-top:7px">${esc(detail)}</p>`:''}${namesMarkup(event.names,event.sport_id,event.names_basis)}<div class="event-bottom">${venue?`<span>場地：${esc(venue)}</span>`:''}${event.note?`<span>${esc(event.note)}</span>`:''}</div></div><div class="event-state"><span class="pill ${info.tone}">${esc(info.text)}</span>${result?`<span class="score">${esc(result)}</span>`:''}${event.opponent&&result?'<span class="small">比分：高雄在前</span>':''}${event.round_rank&&!event.rank?`<span class="small">本輪第 ${event.round_rank} 名</span>`:''}${event.phase==='決賽' && !event.rank?'<span class="small">決賽名次尚待公告</span>':''}${sourceLink(event.report || event.source, event.pdf_page?'官方賽程 PDF':'查看官方依據')}${event.bracket_source && event.bracket_source!==event.source?sourceLink(event.bracket_source,'對戰表'):''}</div></article>`;
+    return `<article class="event-card${isPendingSchedule(event)?' pending-card':''}"><div class="event-time"><strong>${esc(event.time || (isPendingSchedule(event)?'待公布':'待定'))}</strong><span>${esc(timeScope)}</span>${compact?`<span>${shortDate(event.date)} ${weekday(event.date)}</span>`:''}</div><div class="event-main"><div class="event-meta"><span class="sport-tag">${esc(event.sport)}</span>${event.phase?`<span>／ ${esc(event.phase)}</span>`:''}${event.match_no?`<span>第 ${esc(event.match_no)} 場</span>`:''}</div><h3>${esc(title)}</h3>${event.opponent?`<p style="margin-top:5px"><strong>高雄市</strong> <span class="small">vs</span> ${esc(event.opponent)}</p>`:''}${detail?`<p class="small" style="margin-top:7px">${esc(detail)}</p>`:''}${namesMarkup(event.names,event.sport_id,event.names_basis)}<div class="event-bottom">${venue?`<span>場地：${esc(venue)}</span>`:''}${event.note?`<span>${esc(event.note)}</span>`:''}</div></div><div class="event-state"><span class="pill ${info.tone}">${esc(info.text)}</span>${result?`<span class="score">${esc(result)}</span>`:''}${event.opponent&&result?'<span class="small">比分：高雄在前</span>':''}${event.round_rank&&!event.rank?`<span class="small">本輪第 ${event.round_rank} 名</span>`:''}${event.phase==='決賽' && !event.rank?'<span class="small">決賽名次尚待公告</span>':''}${sourceLink(event.report || event.source, event.pdf_page?'官方賽程 PDF':'查看官方依據')}${event.bracket_source && event.bracket_source!==event.source?sourceLink(event.bracket_source,'對戰表'):''}</div></article>`;
   }
   function finalCard(final){
     const tone=final.rank===1?'gold':final.rank===2?'silver':final.rank===3?'bronze':'';
@@ -75,7 +137,7 @@
   function byStatus(event){
     if(state.status==='result')return ['won','lost','draw','result'].includes(event.result_state)||Boolean(event.rank);
     if(state.status==='final')return event.phase==='決賽';
-    if(state.status==='pending')return ['pending','conditional'].includes(event.result_state);
+    if(state.status==='pending')return ['pending','conditional','entry_pending'].includes(event.result_state);
     return true;
   }
   function athleteMatches(athlete){
@@ -83,7 +145,7 @@
     return (!state.sport || athlete.sport_id===state.sport) && matches([athlete.name,athlete.sport,...athlete.groups,details].join(' '),state.query);
   }
   function chooseItems(){
-    if(state.view==='schedule')return data.events.filter(e=>inQuery(e)&&byStatus(e)&&(!state.day||e.date===state.day));
+    if(state.view==='schedule')return calendarItems.filter(e=>inQuery(e)&&byStatus(e)&&(!state.day||e.date===state.day));
     if(state.view==='athletes')return data.athletes.filter(athleteMatches);
     if(state.view==='finals')return data.finals.filter(f=>inQuery(f)&&(!state.day||f.date===state.day)).sort((a,b)=>b.date.localeCompare(a.date)||(a.rank||99)-(b.rank||99));
     return data.sports.filter(s=>(!state.sport||s.id===state.sport) && matches(s.name+' '+data.athletes.filter(a=>a.sport_id===s.id).map(a=>a.name).join(' '),state.query)).sort((a,b)=>{
@@ -93,10 +155,12 @@
   }
   function athleteCard(a){
     const events=a.event_ids.map(id=>eventMap.get(id)).filter(Boolean);
-    const next=events.filter(e=>e.date>=taipeiDay()&&e.result_state!=='conditional').sort((a,b)=>a.date.localeCompare(b.date)||(a.time||'99').localeCompare(b.time||'99'))[0];
+    const calendar=athleteCalendar.get(`${a.sport_id}|${a.name}`)||[];
+    const next=calendar.find(e=>e.date>=taipeiDay()&&e.result_state!=='conditional');
+    const pendingCount=calendar.filter(isPendingSchedule).length;
     const finals=a.final_ids.map(id=>finalMap.get(id)).filter(Boolean);
     const best=finals.filter(f=>f.rank).sort((a,b)=>a.rank-b.rank)[0];
-    return `<article class="athlete-card"><p class="sport-tag small">${esc(a.sport)}</p><h3><button class="name-button" type="button" data-athlete="${a.id}">${esc(a.name)}</button></h3><p class="small">${esc(a.groups.join('、'))}</p><p>${next?`${shortDate(next.date)} ${weekday(next.date)} <strong>${esc(next.time||'時間待確認')}</strong>`:events.length?'已整理場次請點姓名查看':'查看種類期間與官方詳細賽程'}</p><div class="event-bottom"><span>${events.length} 筆已對應場次</span>${best?`<span class="pill ${best.rank===1?'gold':best.rank===2?'silver':best.rank===3?'bronze':''}">最佳第 ${best.rank} 名</span>`:''}</div></article>`;
+    return `<article class="athlete-card"><p class="sport-tag small">${esc(a.sport)}</p><h3><button class="name-button" type="button" data-athlete="${a.id}">${esc(a.name)}</button></h3><p class="small">${esc(a.groups.join('、'))}</p><p>${next?`${shortDate(next.date)} ${weekday(next.date)} <strong>${esc(isPendingSchedule(next)?'出賽時間待確認':next.time||'時間待確認')}</strong>`:events.length?'已整理場次請點姓名查看':'查看種類期間與官方詳細賽程'}</p><div class="event-bottom"><span>${events.length} 筆已對應場次${pendingCount?` · ${pendingCount} 筆出賽待確認`:''}</span>${best?`<span class="pill ${best.rank===1?'gold':best.rank===2?'silver':best.rank===3?'bronze':''}">最佳第 ${best.rank} 名</span>`:''}</div></article>`;
   }
   function sportCard(s, periodOnly=false){
     const athletes=data.athletes.filter(a=>a.sport_id===s.id);
@@ -105,19 +169,19 @@
     const resources=data.resources.filter(r=>r.sport_id===s.id && !r.qualification);
     const uniqueResources=[...new Map(resources.map(r=>[r.label+'|'+r.url,r])).values()];
     const attachments=data.documents.filter(d=>d.sport_id===s.id);
-    return `<article class="sport-card"><div class="event-meta"><span>${periodOnly?'種類期間參考':'115 全民運'}</span><span>${athletes.length} 筆選手登錄</span></div><h3>${esc(s.name)}</h3>${plans.map(p=>`<p class="range">${shortDate(p.start)}${p.start!==p.end?' – '+shortDate(p.end):''}</p><p class="small">${esc(p.discipline)}${p.end_note.includes('雨備')?` · ${esc(p.end_note)}`:''}</p><p class="small">${esc(p.venue)}</p>`).join('')}<p class="small">以上為種類比賽期間，不代表每位選手每天出賽。</p>${athletes.length?namesMarkup(athletes.map(a=>a.name),s.id):'<p class="small">本次高雄公開報名資料未列選手。</p>'}<div class="link-row"><button class="button subtle" data-sport-athletes="${s.id}" type="button">查此種類選手</button><button class="button subtle" data-sport-schedule="${s.id}" type="button">查已對應場次</button></div><div class="link-row">${uniqueResources.map(r=>sourceLink(r.url,r.label)).join('')}</div>${attachments.length?`<details class="doc-list"><summary>官方詳細賽程 · ${attachments.length} 份附件</summary>${attachments.map(d=>`<div class="doc-item"><p>${esc(d.title)}</p><div class="link-row"><button type="button" class="text-button" data-document="${d.id}">站內查看</button>${sourceLink(d.url,'PDF 原檔')}</div></div>`).join('')}</details>`:''}</article>`;
+    return `<article class="sport-card"><div class="event-meta"><span>${periodOnly?'種類期間參考':'115 全民運'}</span><span>${athletes.length} 筆選手登錄</span></div><h3>${esc(s.name)}</h3>${plans.map(p=>`<p class="range">${shortDate(p.start)}${p.start!==p.end?' – '+shortDate(p.end):''}</p><p class="small">${esc(p.discipline)}${p.end_note.includes('雨備')?` · ${esc(p.end_note)}`:''}</p><p class="small">${esc(p.venue)}</p>`).join('')}<p class="small">以上為種類比賽期間，不代表每位選手每天出賽。</p>${athletes.length?namesMarkup(athletes.map(a=>a.name),s.id):'<p class="small">本次高雄公開報名資料未列選手。</p>'}<div class="link-row"><button class="button subtle" data-sport-athletes="${s.id}" type="button">查此種類選手</button><button class="button subtle" data-sport-schedule="${s.id}" type="button">查此種類賽程</button></div><div class="link-row">${uniqueResources.map(r=>sourceLink(r.url,r.label)).join('')}</div>${attachments.length?`<details class="doc-list"><summary>官方詳細賽程 · ${attachments.length} 份附件</summary>${attachments.map(d=>`<div class="doc-item"><p>${esc(d.title)}</p><div class="link-row"><button type="button" class="text-button" data-document="${d.id}">站內查看</button>${sourceLink(d.url,'PDF 原檔')}</div></div>`).join('')}</details>`:''}</article>`;
   }
   function empty(message,detail='') {return `<div class="empty"><h3>${esc(message)}</h3><p>${esc(detail)}</p><button class="button subtle" type="button" data-action="reset">清除篩選，查看全部</button></div>`;}
   function renderDates(){
     $('date-controls').hidden=!['schedule','finals'].includes(state.view);
     $('date-picker').value=state.day;
-    const dates=[...new Set([...data.events.map(e=>e.date),...data.finals.map(f=>f.date),...data.plans.flatMap(p=>[p.start,p.end]),taipeiDay(),...(state.day?[state.day]:[])])].sort();
+    const dates=[...new Set([...calendarItems.map(e=>e.date),...data.finals.map(f=>f.date),...data.plans.flatMap(p=>[p.start,p.end]),taipeiDay(),...(state.day?[state.day]:[])])].sort();
     $('date-strip').innerHTML=dates.map(day=>`<button class="date-day ${day===state.day?'selected':''}" data-date="${day}" type="button" aria-pressed="${day===state.day}"><span>${weekday(day)}${day===taipeiDay()?' · 今天':''}</span><strong>${shortDate(day)}</strong></button>`).join('');
   }
   function renderStats(){
-    const dayEvents=data.events.filter(e=>e.date===taipeiDay() && e.result_state!=='conditional');
+    const dayEvents=calendarItems.filter(e=>e.date===taipeiDay());
     const counts=[1,2,3].map(rank=>data.finals.filter(f=>f.rank===rank).length);
-    $('stats').innerHTML=`<div class="stat"><div class="stat-label">今天已對應場次</div><div class="stat-value">${dayEvents.length}</div><div class="stat-sub">另有 ${data.events.filter(e=>e.date===taipeiDay()&&e.result_state==='conditional').length} 筆晉級待確認</div></div><div class="stat"><div class="stat-label">高雄選手登錄</div><div class="stat-value">${data.athletes.length}</div><div class="stat-sub">同名跨種類分列</div></div><div class="stat"><div class="stat-label">官方已公告獎牌</div><div class="breakdown"><span>金 <b>${counts[0]}</b></span><span>銀 <b>${counts[1]}</b></span><span>銅 <b>${counts[2]}</b></span></div><div class="stat-sub">團體項目每項計 1 面</div></div><div class="stat"><div class="stat-label">競賽資料涵蓋</div><div class="stat-value">${data.sports.length}<span style="font-size:16px;font-weight:500"> 種</span></div><div class="stat-sub">${data.documents.length} 份官方賽程附件</div></div>`;
+    $('stats').innerHTML=`<div class="stat"><div class="stat-label">今天賽程筆數</div><div class="stat-value">${dayEvents.length}</div><div class="stat-sub">含 ${dayEvents.filter(isPendingSchedule).length} 筆個別出賽待確認</div></div><div class="stat"><div class="stat-label">高雄選手登錄</div><div class="stat-value">${data.athletes.length}</div><div class="stat-sub">同名跨種類分列</div></div><div class="stat"><div class="stat-label">官方已公告獎牌</div><div class="breakdown"><span>金 <b>${counts[0]}</b></span><span>銀 <b>${counts[1]}</b></span><span>銅 <b>${counts[2]}</b></span></div><div class="stat-sub">團體項目每項計 1 面</div></div><div class="stat"><div class="stat-label">競賽資料涵蓋</div><div class="stat-value">${data.sports.length}<span style="font-size:16px;font-weight:500"> 種</span></div><div class="stat-sub">${data.documents.length} 份官方賽程附件</div></div>`;
   }
   function render(){
     document.querySelectorAll('[data-view]').forEach(b=>{const active=b.dataset.view===state.view;b.classList.toggle('active',active);if(active)b.setAttribute('aria-current','page');else b.removeAttribute('aria-current');});
@@ -126,19 +190,19 @@
     renderDates();currentItems=chooseItems();
     const title={schedule:state.day?`${shortDate(state.day)} ${weekday(state.day)} · 比賽日程`:'全部比賽日程',athletes:'高雄選手名單',finals:'決賽與名次',sports:'全部競賽種類'};
     $('result-title').textContent=title[state.view];
-    $('result-summary').textContent=state.view==='sports'?`${currentItems.length} 種 · 依種類結束日期排列，已結束項目列於後方`:state.view==='athletes'?`${currentItems.length} 筆選手登錄 · 點姓名查看個人賽程與成績`:state.view==='finals'?`${currentItems.length} 筆最終成績 · 團體成績每項計 1 筆`:`${currentItems.length} 筆場次 · 時間皆為臺灣時間`;
+    $('result-summary').textContent=state.view==='sports'?`${currentItems.length} 種 · 依種類結束日期排列，已結束項目列於後方`:state.view==='athletes'?`${currentItems.length} 筆選手登錄 · 點姓名查看個人賽程與成績`:state.view==='finals'?`${currentItems.length} 筆最終成績 · 團體成績每項計 1 筆`:`${currentItems.length} 筆賽程 · ${currentItems.filter(isPendingSchedule).length} 筆個別出賽待確認 · 時間皆為臺灣時間`;
     let content='';
     if(state.view==='schedule'){
       let lastDay='';
       content=currentItems.map(event=>{let header='';if(event.date!==lastDay){lastDay=event.date;header=`<h3 class="day-heading">${shortDate(event.date)} ${weekday(event.date)} <span>${event.date.slice(0,4)}</span></h3>`;}return header+eventCard(event);}).join('');
-      if(!currentItems.length)content=empty('這個條件下沒有已對應的選手場次','可換日期或種類查詢。未列出場次不代表沒有比賽，其他資訊可查看下方官方賽程。');
+      if(!currentItems.length)content=empty('這個條件下沒有賽程資料','可換日期或種類查詢，或查看官方完整賽程。');
       if(state.query){
         const people=data.athletes.filter(athleteMatches);
         if(people.length)content=`<div class="coverage"><p>找到 ${people.length} 筆選手登錄 · 點姓名查看全部日期的個人賽程</p><div class="names">${people.slice(0,6).map(a=>`<button class="name-button" type="button" data-athlete="${a.id}">${esc(a.name)}<span class="small">（${esc(a.sport)}）</span></button>`).join('')}</div>${people.length>6?'<button class="text-button" type="button" data-view="athletes">查看全部符合的選手</button>':''}</div>`+content;
       }
       if(!state.status){
         const related=data.sports.filter(s=>(!state.sport||s.id===state.sport) && data.athletes.some(a=>a.sport_id===s.id&&matches(a.name+' '+s.name,state.query)) && data.plans.some(p=>p.sport_id===s.id&&(!state.day||(p.start<=state.day&&p.end>=state.day))));
-        if(related.length)content+=`<h3 class="day-heading">其他種類與完整賽程</h3><p class="coverage">部分賽程仍以 PDF 公告。下方保留完整附件及高雄名單；未完成個人場次對應的資料，請以附件中的組別、項目與出場順序確認。</p><div class="sport-grid">${related.map(s=>sportCard(s,true)).join('')}</div>`;
+        if(related.length)content+=`<h3 class="day-heading">官方完整賽程與名單</h3><p class="coverage">已排定的日期也會列在上方日程。標示「個別出賽待確認」的名單是高雄報名選手；實際上場日期、時間與人員，仍以大會公告及下方附件為準。</p><div class="sport-grid">${related.map(s=>sportCard(s,true)).join('')}</div>`;
       }
     }else if(state.view==='athletes'){
       const pages=Math.max(1,Math.ceil(currentItems.length/pageSize));state.page=Math.min(state.page,pages);
@@ -159,12 +223,14 @@
   function showAthlete(id){
     const a=data.athletes.find(a=>a.id===id);if(!a)return;
     const events=a.event_ids.map(id=>eventMap.get(id)).filter(Boolean);
+    const pending=(athleteCalendar.get(`${a.sport_id}|${a.name}`)||[]).filter(isPendingSchedule);
     const finals=a.final_ids.map(id=>finalMap.get(id)).filter(Boolean);
     const plans=data.plans.filter(p=>p.sport_id===a.sport_id);
     const attachments=data.documents.filter(d=>d.sport_id===a.sport_id);
     let content=`<div class="detail-list"><p><strong>${esc(a.sport)}</strong> · ${esc(a.groups.join('、'))}</p><p class="small">高雄市代表隊 · 以下場次與成績依官方公開資料整理。</p></div>`;
     if(finals.length)content+=`<h3 class="day-heading">最終成績</h3>${finals.map(finalCard).join('')}`;
     content+=`<h3 class="day-heading">已對應的比賽場次 <span>${events.length} 筆</span></h3>${events.length?events.map(e=>eventCard(e,true)).join(''):'<div class="empty">尚無可精確對應此選手的場次。請查看下方完整賽程附件。</div>'}`;
+    if(pending.length)content+=`<h3 class="day-heading">已排賽程・個別出賽待確認 <span>${pending.length} 筆</span></h3><p class="coverage">此選手已列於高雄報名名單。以下保留相關項目賽程或競賽期間；是否當日出賽及實際時間仍待公布／確認。</p>${pending.map(e=>eventCard(e,true)).join('')}`;
     content+=`<h3 class="day-heading">種類比賽期間</h3><p class="small">此處為整個種類的期間，不是這位選手每天都要出賽。</p>${plans.map(p=>`<p style="margin-top:8px">${esc(p.discipline)}：${shortDate(p.start)} – ${shortDate(p.end)}</p>`).join('')}<h3 class="day-heading">官方詳細賽程</h3>${attachments.map(d=>`<div class="doc-item"><p>${esc(d.title)}</p><div class="link-row"><button class="text-button" data-document="${d.id}" type="button">站內查看</button>${sourceLink(d.url,'PDF 原檔')}</div></div>`).join('')}<div class="link-row">${a.sources.slice(0,3).map(url=>sourceLink(url,'官方名單／成績')).join('')}</div>`;
     openDialog(a.name,content);
   }
@@ -206,7 +272,7 @@
   }
   function exportCSV(){
     let rows=[];
-    if(state.view==='schedule')rows=[['日期','時間','時間性質','種類','項目','階段','選手姓名','名單性質','對手','狀態','本輪名次','決賽名次','成績（高雄在前）','官方依據'],...currentItems.map(e=>[e.date,e.time||'待確認',e.time_scope==='event'?'項目開始':e.time_scope==='match'?'表定時間':'個別時間待確認',e.sport,e.title,e.phase,e.names.join('、'),e.result_state==='conditional'?'報名名單，晉級待確認':nameBasisLabel[e.names_basis]||'官方名單',e.opponent,statusInfo(e).text,e.round_rank||'',e.rank||'',scoreLabel(e),e.source])];
+    if(state.view==='schedule')rows=[['日期','時間','時間性質','實際出賽資訊','種類','項目','階段','選手姓名','名單性質','對手','狀態','本輪名次','決賽名次','成績（高雄在前）','官方依據'],...currentItems.map(e=>[e.date,e.time||'待公布／確認',timeScopeLabel(e),isPendingSchedule(e)?e.note:e.result_state==='conditional'?'晉級名單待確認':'依官方場次／出場表',e.sport,e.title,e.phase,e.names.join('、'),e.result_state==='conditional'?'報名名單，晉級待確認':nameBasisLabel[e.names_basis]||'官方名單',e.opponent,statusInfo(e).text,e.round_rank||'',e.rank||'',scoreLabel(e),e.source])];
     else if(state.view==='athletes')rows=[['姓名','種類','組別','已對應場次','最終成績筆數','官方名單'],...currentItems.map(a=>[a.name,a.sport,a.groups.join('、'),a.event_ids.length,a.final_ids.length,a.sources[0]])];
     else rows=[['日期','種類','項目','選手姓名','最終名次','成績','官方依據'],...currentItems.map(f=>[f.date,f.sport,f.title,f.names.join('、'),f.rank_text,f.score,f.source])];
     const blob=new Blob(['\uFEFF'+rows.map(r=>r.map(csvCell).join(',')).join('\r\n')],{type:'text/csv;charset=utf-8;'});const url=URL.createObjectURL(blob);const link=document.createElement('a');link.href=url;link.download=`sport115-高雄-${state.view}-${state.day||'全部'}.csv`;link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
@@ -215,7 +281,7 @@
   try{const p=new URLSearchParams(location.hash.slice(1));if(['schedule','athletes','finals','sports'].includes(p.get('view')))state.view=p.get('view');const day=p.get('date')||'';if(/^2026-\d{2}-\d{2}$/.test(day)&&!Number.isNaN(Date.parse(day))&&new Date(day).toISOString().slice(0,10)===day)state.day=day;else if(location.hash)state.day='';if(data.sports.some(s=>s.id===p.get('sport')))state.sport=p.get('sport');state.query=p.get('q')||'';if(['result','final','pending'].includes(p.get('status')))state.status=p.get('status');}catch{}
   indexData();
   $('sport-filter').innerHTML='<option value="">全部種類</option>'+data.sports.map(s=>`<option value="${s.id}">${esc(s.name)}</option>`).join('');
-  $('source-notes').innerHTML=`<p>比賽日程、最終成績及前後一天內的逐場報告與出場名單，預設每 10 分鐘擷取一次；其他日期資料、PDF 與全市報名名單每日檢查一次。網頁每分鐘檢查已發布的新資料。排程可能延遲，請以顯示的資料時間判斷。</p><p style="margin-top:8px">「檢查更新」讀取最近已同步的版本，不會直接觸發官網爬取。已知賽程開始後仍無成績，顯示「待官方更新」，不推測正在比賽或已遭淘汰。</p><p style="margin-top:8px">個人項目的「項目開始」是該項目的表定時間；個別選手上場仍可能依檢錄與賽序調整。官網 HTML、官方 PDF 與對戰表無法確實對應的資料，保留在種類頁的附件中，不補造時間、名字或名次。</p><p style="margin-top:8px">本次整理：${data.registrations.length} 筆選手報名人次、${data.documents.length} 份賽程 PDF。相同姓名跨種類分列，本站無法用公開姓名辨識所有同名者。${sourceLink(data.meta.sources.roster,'報名來源')} ${sourceLink(data.meta.sources.finals,'名次來源')}</p>`;
+  $('source-notes').innerHTML=`<p>比賽日程、最終成績及前後一天內的逐場報告與出場名單，預設每 10 分鐘擷取一次；其他日期資料、PDF 與全市報名名單每日檢查一次。網頁每分鐘檢查已發布的新資料。排程可能延遲，請以顯示的資料時間判斷。</p><p style="margin-top:8px">「檢查更新」讀取最近已同步的版本，不會直接觸發官網爬取。已知賽程開始後仍無成績，顯示「待官方更新」，不推測正在比賽或已遭淘汰。</p><p style="margin-top:8px">個人項目的「項目開始」是該項目的表定時間；個別選手上場仍可能依檢錄與賽序調整。尚未對應個別出賽的已排日期，會照常列入比賽日程，附高雄相關報名名單並標示「個別出賽待確認」。若只公告競賽期間，日期僅供參考，不代表每位選手每天出賽。</p><p style="margin-top:8px">本次整理：${data.registrations.length} 筆選手報名人次、${data.documents.length} 份賽程 PDF。相同姓名跨種類分列，本站無法用公開姓名辨識所有同名者。${sourceLink(data.meta.sources.roster,'報名來源')} ${sourceLink(data.meta.sources.finals,'名次來源')}</p>`;
   $('updated-at').textContent='資料更新 '+prettyStamp(data.meta.checked_at);
   $('source-notes').insertAdjacentHTML('afterbegin','<p style="margin-bottom:8px">啟用 GitHub 更新流程後，定時擷取期間為 2026 年 9–10 月；賽會結束後保留查詢，也可手動更新。</p>');
   renderStats();render();updateNotice();
