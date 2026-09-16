@@ -120,7 +120,8 @@ def softball_events(doc,registrations):
     return events
 
 def extract_pdf_events(documents,registrations,plans):
-    events=[]
+    from pdf_sessions import extract_sessions
+    events=extract_sessions(documents,registrations)
     for doc in documents:
         sid=doc['sport_id']
         if sid not in ('210','213','209','214','205','134','211') or '資格' in doc['title']:continue
@@ -203,7 +204,7 @@ def extract_pdf_events(documents,registrations,plans):
     # Equal rows can appear in both a summary and a detailed PDF.
     unique={}
     for e in events:
-        signature=(e['sport_id'],e['date'],e['time'],e['title'],e['phase'],e['opponent'],e.get('match_no',''))
+        signature=(e['sport_id'],e['date'],e['time'],e['title'],e['phase'],e['opponent'],e.get('match_no',''),e.get('venue',''))
         if signature in unique:
             unique[signature]['names']=list(dict.fromkeys(unique[signature]['names']+e['names']))
         else:unique[signature]=e

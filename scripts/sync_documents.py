@@ -18,7 +18,7 @@ def main():
     if previous and not args.force and not args.offline_manifest:
         same_urls={d['url'] for d in previous['documents']}=={d['url'] for d in snapshot['documents']}
         age=(datetime.now(timezone.utc)-datetime.fromisoformat(previous['checked_at'])).total_seconds()
-        if same_urls and age<86400:print('Schedule PDFs already checked today');return
+        if same_urls and age<86400 and previous.get('extraction_version')==2:print('Schedule PDFs already checked today');return
     manifest=json.loads(args.offline_manifest.read_text()) if args.offline_manifest else {}
     mapping={official_url(url):args.offline_manifest.parent/(name+'.html') for name,url in manifest.items()} if manifest else {}
     def read(doc):
@@ -38,15 +38,16 @@ def main():
             observed=datetime.now(timezone.utc).isoformat()
         reader=PdfReader(io.BytesIO(raw))
         pages=[unicodedata.normalize('NFKC',page.extract_text() or '') for page in reader.pages]
-        tables=[]
+        tables=[];layout_pages=[]
         # Table geometry is useful for date cells spanning several match rows.
-        if doc['sport_id'] in ('210','213','209','214','205','134','211') and '資格' not in doc['title']:
+        if '資格' not in doc['title']:
             with pdfplumber.open(io.BytesIO(raw)) as pdf:
                 for index,page in enumerate(pdf.pages):
                     tables.append({'page':index+1,'tables':page.extract_tables()})
-        return {**doc,'sha256':hashlib.sha256(raw).hexdigest(),'checked_at':observed,'page_count':len(pages),'pages':pages,'tables':tables,'searchable':any(p.strip() for p in pages)}
+                    layout_pages.append(unicodedata.normalize('NFKC',page.extract_text() or ''))
+        return {**doc,'sha256':hashlib.sha256(raw).hexdigest(),'checked_at':observed,'page_count':len(pages),'pages':pages,'layout_pages':layout_pages,'tables':tables,'searchable':any(p.strip() for p in pages)}
     with ThreadPoolExecutor(max_workers=3) as pool:documents=list(pool.map(read,snapshot['documents']))
-    data={'schema_version':1,'checked_at':max(d['checked_at'] for d in documents),'documents':documents}
+    data={'schema_version':1,'extraction_version':2,'checked_at':max(d['checked_at'] for d in documents),'documents':documents}
     raw=json.dumps(data,ensure_ascii=False,separators=(',',':'))
     for name,content in [('documents.json',raw),('documents.js','window.SPORT115_DOCUMENTS = '+raw.replace('</','<\\/')+';\n')]:
         tmp=output/(name+'.tmp');tmp.write_text(content,encoding='utf-8');tmp.replace(output/name)

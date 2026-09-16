@@ -1,6 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { matches, taipeiDay, statusInfo, scoreLabel, csvCell, safeUrl, buildScheduleItems, isPendingSchedule, timeScopeLabel, isMedalEvent, eventNames } = require('../site/app.js');
+require('./render.test.cjs'); // Keep page rendering checks in the existing CI entry point.
 
 test('today follows Taiwan time at the midnight boundary', () => {
   assert.equal(taipeiDay(new Date('2026-09-14T15:59:59Z')), '2026-09-14');
@@ -128,13 +129,40 @@ test('a published event roster without Kaohsiung entries is not treated as an un
   snapshot.entries[0].roster_published=false;
   assert.equal(buildScheduleItems(snapshot).length,1);
 });
-test('published PDF schedules suppress period placeholders only for their discipline',()=>{
+test('a PDF link without imported rows keeps a visible calendar reference',()=>{
   const snapshot=calendarFixture();
   snapshot.plans.push({...snapshot.plans[0],id:'art',discipline:'滑輪溜冰-花式'});
   snapshot.documents=[{sport_id:'303',title:'滑輪溜冰(競速)-賽程表.pdf'}];
   const items=buildScheduleItems(snapshot);
-  assert.equal(items.length,3);
-  assert.ok(items.every(e=>e.title.includes('花式')&&e.names.includes('乙選手')));
+  assert.equal(items.length,6);
+  const speed=items.filter(e=>e.title.includes('競速'));
+  assert.equal(speed.length,3);
+  assert.ok(speed.every(e=>e.schedule_scope==='document'&&e.names.includes('甲選手')));
+  assert.ok(items.filter(e=>e.title.includes('花式')).every(e=>e.schedule_scope==='period'));
+});
+
+test('an imported PDF session preserves its date and time without a duplicate period',()=>{
+  const snapshot=calendarFixture();
+  snapshot.events=[{id:'pdf',sport_id:'303',sport:'滑輪溜冰',title:'競速100公尺',date:'2026-09-15',time:'09:00',names:['甲選手'],schedule_scope:'session',time_scope:'session'}];
+  snapshot.documents=[{sport_id:'303',title:'競速賽程.pdf'}];
+  assert.deepEqual(buildScheduleItems(snapshot),snapshot.events);
+  assert.equal(timeScopeLabel(snapshot.events[0]),'時段開始・依序進行');
+});
+
+test('official reference schedules do not invent Kaohsiung athletes',()=>{
+  const event={id:'canoe',sport_id:'126',sport:'輕艇水球',title:'女子組決賽',phase:'決賽',date:'2026-10-16',time:'14:20',names:[],participation:'no_registration'};
+  assert.equal(statusInfo(event).text,'未列高雄隊伍');
+  assert.deepEqual(eventNames(event),[]);
+});
+
+test('every registered sport remains discoverable in the calendar, including attachment fallbacks',()=>{
+  const snapshot=require('../site/data/snapshot.json');
+  const items=buildScheduleItems(snapshot);
+  for(const sport of snapshot.sports){
+    const registrations=snapshot.registrations.filter(r=>r.sport_id===sport.id);
+    if(!registrations.length)continue;
+    assert.ok(items.some(e=>e.sport_id===sport.id&&eventNames(e).length),`${sport.name} disappeared from the calendar`);
+  }
 });
 test('short and long programs on the same day remain distinct',()=>{
   const snapshot=calendarFixture();snapshot.plans=[];

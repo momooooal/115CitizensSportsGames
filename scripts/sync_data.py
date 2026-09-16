@@ -494,7 +494,7 @@ def join_events(schedule, entries, report_docs):
 def merge_pdf_events(records,pdf_events):
     for event in pdf_events:
         # Sharing a time and one athlete does not make two disciplines identical.
-        same=next((r for r in records if r['sport_id']==event['sport_id'] and r['date']==event['date'] and r.get('time')==event['time'] and item_title(r['title'])==item_title(event['title']) and r.get('phase','')==event.get('phase','') and norm(r.get('opponent'))==norm(event.get('opponent')) and r.get('match_no','')==event.get('match_no','')),None)
+        same=next((r for r in records if r['sport_id']==event['sport_id'] and r['date']==event['date'] and r.get('time')==event['time'] and item_title(r['title'])==item_title(event['title']) and r.get('phase','')==event.get('phase','') and norm(r.get('opponent'))==norm(event.get('opponent')) and r.get('match_no','')==event.get('match_no','') and (not r.get('venue') or not event.get('venue') or r['venue']==event['venue'])),None)
         if same:
             if same.get('names_basis')=='report':
                 same['registered_names']=list(dict.fromkeys(same.get('registered_names',[])+event['names']))
@@ -569,7 +569,8 @@ def validate_snapshot(data):
         ids=[x['id'] for x in data[section]]
         if len(ids)!=len(set(ids)):raise ValueError('Duplicate IDs in '+section)
     for event in data['events']:
-        if not event['names']:raise ValueError('Kaohsiung event without names')
+        if not event['names'] and event.get('participation')!='no_registration':raise ValueError('Kaohsiung event without names')
+        if event.get('participation')=='no_registration' and (event['names'] or any(r['sport_id']==event['sport_id'] for r in data['registrations'])):raise ValueError('Incorrect public-only schedule classification')
         datetime.fromisoformat(event['date'])
         if event.get('time') and not re.fullmatch(r'\d{2}:\d{2}',event['time']):raise ValueError('Invalid event time')
         if event.get('rank') and not (event['phase']=='決賽' or event.get('medal_event') and event.get('medal_source')):raise ValueError('A preliminary rank was treated as a final rank')
