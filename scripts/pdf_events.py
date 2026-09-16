@@ -4,10 +4,13 @@ Only supported observed table layouts are converted. Other PDFs remain fully
 available in the document viewer. Dates are never copied across unrelated tables.
 """
 import re
-from sync_data import clean,norm,key,date_iso,CITY
+from sync_data import clean,norm,key,date_iso,CITY,placement_stage
 
 def make(doc,page,day,tm,title,names,opponent='',group='',no='',basis='pdf_roster'):
-    return {'id':key('pdf',doc['url'],page,day,tm,title,','.join(names),opponent),'sport_id':doc['sport_id'],'sport':doc['sport'],'date':day,'time':tm,'time_scope':'match','title':doc['sport']+title,'phase':'預賽' if '預賽' in title else '', 'names':list(dict.fromkeys(names)),'names_basis':basis,'opponent':opponent,'score':'','score_order':'','note':'','rank':None,'round_rank':None,'advancement':None,'result_state':'pending','source':doc['url']+'#page='+str(page),'links':[],'pdf_page':page,'match_no':no,'group':group}
+    phase=placement_stage(title)
+    record={'id':key('pdf',doc['url'],page,day,tm,title,','.join(names),opponent),'sport_id':doc['sport_id'],'sport':doc['sport'],'date':day,'time':tm,'time_scope':'match','title':doc['sport']+title,'phase':phase, 'names':list(dict.fromkeys(names)),'names_basis':basis,'opponent':opponent,'score':'','score_order':'','note':'','rank':None,'round_rank':None,'advancement':None,'result_state':'pending','source':doc['url']+'#page='+str(page),'links':[],'pdf_page':page,'match_no':no,'group':group}
+    if phase in ('決賽','銅牌賽'):record.update(medal_event=True,medal_source=record['source'],medal_basis='官方 PDF 標示'+phase)
+    return record
 
 def group_names(registrations,sid,gender):
     return list(dict.fromkeys(r['name'] for r in registrations if r['sport_id']==sid and (not gender or gender in r['group'])))
@@ -17,7 +20,7 @@ def read_day(raw,month):
     if compact.isdigit() and 1<=int(compact)<=31:return f'2026-{month:02d}-{int(compact):02d}'
     return date_iso(compact)
 
-def taichi_events(doc):
+def taichi_events(doc,registrations):
     slots=[];events=[]
     first=next((p for p in doc.get('tables',[]) if p['page']==1),None)
     if not first:return events
@@ -56,7 +59,38 @@ def taichi_events(doc):
         record['time_scope']='event';record['note']=slot['court']+' · 項目時段 '+slot['time']+'–'+slot['end']+' · 出場順序：'+'、'.join(orders)
         record['links']=[{'label':'項目時間表','url':doc['url']+'#page=1'}];events.append(record)
         if slot['final_time']:
-            final={**record,'id':key(record['id'],'conditional-final'),'time':slot['final_time'],'phase':'決賽','result_state':'conditional','note':slot['court']+' · 決賽出場名單待公布','names_basis':'registration'};events.append(final)
+            final={**record,'id':key(record['id'],'conditional-final'),'time':slot['final_time'],'phase':'決賽','medal_event':True,'medal_source':doc['url']+'#page=1','medal_basis':'官方套路時段表列決賽','result_state':'conditional','note':slot['court']+' · 決賽出場名單待公布','names_basis':'registration'};events.append(final)
+    second=next((p for p in doc.get('tables',[]) if p['page']==2),None)
+    if not second:return events
+    push_names=list(dict.fromkeys(r['name'] for r in registrations if r['sport_id']=='134' and '推手' in r['group'] and '對練' not in r['group']))
+    pairs={}
+    for page in doc.get('tables',[]):
+        text=clean(doc['pages'][page['page']-1])
+        gender='男子' if '男子指定推手對練' in text else '女子' if '女子指定推手對練' in text else None
+        if not gender:continue
+        for table in page['tables']:
+            for row in table:
+                if len(row)>=3 and clean(row[0])==CITY:
+                    pairs[gender]=([clean(n) for n in re.split(r'[/／、]',clean(row[1])) if clean(n)],clean(row[2]),page['page'])
+    for table in second['tables']:
+        day=None;gender=None
+        for raw in table:
+            row=[clean(c) for c in raw]
+            if len(row)<3:continue
+            day=read_day(row[0],10) or day
+            times=re.findall(r'\d{1,2}:\d{2}',row[1]);label=row[2]
+            if not day or len(times)!=2 or not re.search(r'賽',label) or '練習' in label:continue
+            if '指定推手對練' in label:gender='男子' if '男子' in label else '女子'
+            if gender and gender in pairs:
+                names,order,page=pairs[gender];final=label=='決賽'
+                rec=make(doc,page,day,times[0],gender+'指定推手對練'+('決賽' if final else '初賽'),names)
+                rec.update(time_scope='event',note='丙場地 · 項目時段 '+times[0]+'–'+times[1]+(' · 決賽名單待公布' if final else ' · 第'+order+'組'),links=[{'label':'項目時間表','url':doc['url']+'#page=2'}])
+                if final:rec.update(result_state='conditional',names_basis='registration')
+                events.append(rec)
+            elif push_names and '定步' in label:
+                rec=make(doc,2,day,times[0],'推手｜'+label,push_names,basis='group_registration')
+                rec.update(schedule_scope='session',time_scope='event',result_state='conditional' if '決賽' in label else 'entry_pending',note='丙、丁場地 · 項目時段 '+times[0]+'–'+times[1]+'；以下為推手報名名單，個人場次及實際出賽時間待公布／確認。')
+                events.append(rec)
     return events
 
 def softball_events(doc,registrations):
@@ -90,7 +124,7 @@ def extract_pdf_events(documents,registrations,plans):
     for doc in documents:
         sid=doc['sport_id']
         if sid not in ('210','213','209','214','205','134','211') or '資格' in doc['title']:continue
-        if sid=='134':events.extend(taichi_events(doc));continue
+        if sid=='134':events.extend(taichi_events(doc,registrations));continue
         if sid=='211':events.extend(softball_events(doc,registrations));continue
         months={int(p['start'][5:7]) for p in plans if p['sport_id']==sid}
         if len(months)!=1:continue
@@ -154,9 +188,10 @@ def extract_pdf_events(documents,registrations,plans):
                         for i,value in enumerate(row):
                             if CITY not in value:continue
                             suffix=clean(value.split(CITY,1)[1])
-                            if suffix:names.extend([r['name'] for r in registrations if r['sport_id']==sid and norm(r['name'])==norm(suffix)])
+                            def name_key(value):return norm(re.sub(r'^[※＊*†‡\s]+','',clean(value)))
+                            if suffix:names.extend([r['name'] for r in registrations if r['sport_id']==sid and norm(r['name'])==name_key(suffix)])
                             elif i+2<len(row):
-                                names.extend([r['name'] for r in registrations if r['sport_id']==sid and norm(r['name']) in [norm(n) for n in row[i+2].split(' ')]])
+                                names.extend([r['name'] for r in registrations if r['sport_id']==sid and norm(r['name']) in [name_key(n) for n in re.split(r'[\s/／、]+',row[i+2])]])
                         if not names:continue
                         before=' '.join(v for r in rows[:3] for v in r)
                         label=next((v for r in rows[:3] for v in r if re.search(r'(桿數賽|球道賽).*(男|女)',v)),None)
@@ -168,7 +203,7 @@ def extract_pdf_events(documents,registrations,plans):
     # Equal rows can appear in both a summary and a detailed PDF.
     unique={}
     for e in events:
-        signature=(e['sport_id'],e['date'],e['time'],e['title'],e['opponent'])
+        signature=(e['sport_id'],e['date'],e['time'],e['title'],e['phase'],e['opponent'],e.get('match_no',''))
         if signature in unique:
             unique[signature]['names']=list(dict.fromkeys(unique[signature]['names']+e['names']))
         else:unique[signature]=e

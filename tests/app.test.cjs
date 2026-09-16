@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { matches, taipeiDay, statusInfo, scoreLabel, csvCell, safeUrl, buildScheduleItems, isPendingSchedule, timeScopeLabel } = require('../site/app.js');
+const { matches, taipeiDay, statusInfo, scoreLabel, csvCell, safeUrl, buildScheduleItems, isPendingSchedule, timeScopeLabel, isMedalEvent, eventNames } = require('../site/app.js');
 
 test('today follows Taiwan time at the midnight boundary', () => {
   assert.equal(taipeiDay(new Date('2026-09-14T15:59:59Z')), '2026-09-14');
@@ -17,7 +17,7 @@ test('an unconfirmed final remains unconfirmed after the scheduled start', () =>
 });
 test('preliminary rank is not displayed as final rank', () => {
   assert.equal(statusInfo({ round_rank:1, result_state:'result' }).text,'已有成績');
-  assert.equal(statusInfo({ rank:2, phase:'決賽', result_state:'result' }).text,'決賽第 2 名');
+  assert.equal(statusInfo({ rank:2, phase:'決賽', result_state:'result' }).text,'最終第 2 名');
 });
 test('name and sport search accepts multiple terms and 台／臺 variants', () => {
   assert.ok(matches('王立淳 滑輪溜冰','王立淳 滑輪'));
@@ -93,12 +93,12 @@ test('a published named appearance replaces its pending session without duplicat
   assert.equal(items[0].id,'named');
   assert.ok(!isPendingSchedule(items[0]));
 });
-test('one named participant does not hide a day with other unconfirmed registrations',()=>{
+test('a published discipline schedule replaces the generic period even if not everyone competes that day',()=>{
   const snapshot=calendarFixture();snapshot.plans[0].end='2026-09-14';
   snapshot.registrations.push({sport_id:'303',name:'丁選手',group:'男子組競速溜冰'});
   snapshot.events=[{id:'known',sport_id:'303',sport:'滑輪溜冰',title:'競速100公尺',date:'2026-09-14',time:'08:00',names:['甲選手']}];
-  assert.equal(buildScheduleItems(snapshot).length,2);
-  assert.ok(buildScheduleItems(snapshot).some(e=>isPendingSchedule(e)&&e.names.includes('丁選手')));
+  assert.equal(buildScheduleItems(snapshot).length,1);
+  assert.ok(!buildScheduleItems(snapshot).some(e=>e.schedule_scope==='period'));
 });
 test('a named preliminary does not hide an unannounced final of the same item on the same day',()=>{
   const snapshot=calendarFixture();snapshot.plans=[];
@@ -127,4 +127,30 @@ test('a published event roster without Kaohsiung entries is not treated as an un
   assert.deepEqual(buildScheduleItems(snapshot),[]);
   snapshot.entries[0].roster_published=false;
   assert.equal(buildScheduleItems(snapshot).length,1);
+});
+test('published PDF schedules suppress period placeholders only for their discipline',()=>{
+  const snapshot=calendarFixture();
+  snapshot.plans.push({...snapshot.plans[0],id:'art',discipline:'滑輪溜冰-花式'});
+  snapshot.documents=[{sport_id:'303',title:'滑輪溜冰(競速)-賽程表.pdf'}];
+  const items=buildScheduleItems(snapshot);
+  assert.equal(items.length,3);
+  assert.ok(items.every(e=>e.title.includes('花式')&&e.names.includes('乙選手')));
+});
+test('short and long programs on the same day remain distinct',()=>{
+  const snapshot=calendarFixture();snapshot.plans=[];
+  const item={id:'long',sport_id:'303',sport:'滑輪溜冰',pid:'art',date:'2026-09-16',time:'16:20',title:'女子組花式直排(長曲)',phase:'',source:'https://sport115.tycg.gov.tw/'};
+  snapshot.scheduled_sessions=[item];
+  snapshot.events=[{...item,id:'short',title:'女子組花式直排(短曲)',time:'10:00',names:['乙選手']}];
+  assert.equal(buildScheduleItems(snapshot).length,2);
+});
+test('medal filters include verified untitled finals and bronze matches, not preliminary leaders',()=>{
+  assert.ok(isMedalEvent({title:'5000公尺計分賽',medal_event:true}));
+  assert.ok(isMedalEvent({phase:'銅牌賽'}));
+  assert.ok(!isMedalEvent({phase:'準決賽',round_rank:1}));
+  assert.ok(!isMedalEvent({title:'短曲',round_rank:1}));
+});
+test('searchable registration supplements do not overwrite confirmed participants',()=>{
+  const event={names:['甲選手'],registered_names:['甲選手','乙選手']};
+  assert.deepEqual(eventNames(event),['甲選手','乙選手']);
+  assert.deepEqual(event.names,['甲選手']);
 });

@@ -20,6 +20,7 @@ SOURCES = {
  'plan': BASE + '/Module/Pages/Index.php?ID=425',
  'catalog': BASE + '/Module/SportItem/ALL_Index.php',
  'instant': BASE + '/Module/Score/Instant.php',
+ 'awards': BASE + '/Module/Score/Award_Data.php',
 }
 
 def clean(value):
@@ -61,9 +62,53 @@ def date_iso(value):
 def name_lines(cell):
     result=[]
     for value in cell.xpath('.//text()'):
-        value = re.sub(r'^\d+\s*', '', clean(value))
-        if value and value != CITY and not re.fullmatch(r'.{2,4}[市縣]',value): result.append(value)
+        # Reports use both <br> and several bib/name pairs in one text node.
+        for part in re.split(r'[、,，;；\n]|(?<!\S)(?=\d{1,6}\s*[^\d\s])',value):
+            name=re.sub(r'^\d+\s*', '', clean(part))
+            if name and not re.fullmatch(r'.{2,4}[市縣]|選手|姓名',name):result.append(name)
     return list(dict.fromkeys(result))
+
+def item_title(value):
+    """Remove round suffixes, preserving discipline/weight class parentheses."""
+    return norm(re.sub(r'[（(](?:預賽|複賽|準決賽|半決賽|決賽|短曲|長曲|\d+日)[)）]', '',clean(value)))
+
+def is_team_event(event):
+    return bool(re.search(r'團體賽|曲棍球|接力',event['title']))
+
+def placement_stage(value):
+    value=norm(re.sub(r'(?<=\d)[-－](?=\d)',',',clean(value)))
+    if '敗部' in value:return '名次賽'
+    if re.search(r'小組決賽|分組決賽',value):return '分組賽'
+    if re.search(r'冠[、,]?亞|冠軍[賽戰]|金牌[賽戰]|爭?1[,、.及與和~～]2名|[一1][、,及與和][二2]名',value):return '決賽'
+    if re.search(r'季[、,]?殿|季軍[賽戰]|銅牌[賽戰]|爭?3[,、.及與和~～]4名|[三3][、,及與和][四4]名',value):return '銅牌賽'
+    if re.search(r'準決賽|半決賽',value):return '準決賽'
+    if '決賽' in value:return '決賽'
+    if '預賽' in value:return '預賽'
+    if '複賽' in value:return '複賽'
+    return ''
+
+def table_grid(table):
+    """Expand row/column spans before matching headers to athlete cells."""
+    grid=[];spans={}
+    for tr in table.xpath('./tr|./thead/tr|./tbody/tr|./tfoot/tr'):
+        values={col:cell for col,(cell,left) in spans.items()}
+        spans={col:(cell,left-1) for col,(cell,left) in spans.items() if left>1}
+        col=0
+        for cell in tr.xpath('./th|./td'):
+            while col in values:col+=1
+            width=max(1,int(cell.get('colspan','1')));height=max(1,int(cell.get('rowspan','1')))
+            for offset in range(width):
+                values[col+offset]=cell
+                if height>1:spans[col+offset]=(cell,height-1)
+            col+=width
+        if values:grid.append((tr,[values.get(i) for i in range(max(values)+1)]))
+    return grid
+
+def score_table(table):
+    grid=table_grid(table);header_rows=[row for tr,row in grid if tr.xpath('./th') and not tr.xpath('./td')]
+    width=max((len(row) for row in header_rows),default=0)
+    headers=[' '.join(dict.fromkeys(clean(row[i]) for row in header_rows if i<len(row) and clean(row[i]))) for i in range(width)]
+    return headers,[row for tr,row in grid if tr.xpath('./td')]
 
 def table_rows(doc, required):
     for t in doc.xpath('//table[not(.//table)]'):
@@ -206,16 +251,67 @@ def parse_schedule(doc,sid,sport,url):
                 links.append({'label':clean(a),'url':official_url(a.get('href'),url)})
             report=next((a['url'] for a in links if 'InstantScore.php' in a['url']),None)
             q=parse_qs(urlsplit(report).query) if report else {}
-            phase='決賽' if re.search(r'(?<!準)(?<!半)決賽',title) else ('準決賽' if re.search(r'準決賽|半決賽',title) else ('預賽' if '預賽' in title else ('複賽' if '複賽' in title else '')))
+            phase=placement_stage(title)
             events.append({'id':key(sid,day,tm,title),'sport_id':sid,'sport':sport,'date':day,'time':tm,'title':title,'phase':phase,'fid':q.get('FID',[None])[0],'pid':q.get('PID',[None])[0],'report':report,'source':url,'links':links})
     return events
+
+def parse_award_groups(doc):
+    groups=[]
+    for table in table_rows(doc,['項目','應頒獎牌數']):
+        for row in table.xpath('.//tr[td]'):
+            values=[clean(c) for c in cells(row)]
+            if len(values)>=2 and values[1].isdigit():groups.append({'title':values[0],'count':int(values[1])})
+    return groups
+
+def annotate_medal_sessions(schedule,documents,resources,award_groups=(),entries=()):
+    """Use award links and the published PDF, never a preliminary placing."""
+    for event in schedule:
+        title=event['title'];phase=event['phase'];source=None;basis=''
+        daily_team=bool(re.search(r'曲棍球|團體賽',title))
+        award=next((a['url'] for a in event.get('links',[]) if 'Finals_Score.php' in a['url']),None)
+        if phase in ('決賽','銅牌賽'):
+            source=event['source'];basis='官方賽程標示'+phase
+        elif award and not daily_team and phase not in ('預賽','複賽','準決賽') and '短曲' not in title:
+            source=award;basis='此場次連結官方頒獎名單'
+        if event['sport_id']=='303' and not phase:
+            speed=next((d for d in documents if d['sport_id']=='303' and '競速' in d['title']),None)
+            if speed and '競速' in title:
+                label=norm(title.split('競速溜冰')[-1]).replace('美式接力','接力賽')
+                gender='女子組' if '女子組' in title else '男子組'
+                for page,text in enumerate(speed.get('pages',[]),1):
+                    if re.sub(r'\s+','',gender+label+'-決賽') in re.sub(r'\s+','',clean(text)):
+                        source=speed['url']+'#page='+str(page);basis='官方 PDF 將本項目列為決賽';break
+            art=next((d for d in documents if d['sport_id']=='303' and '花式' in d['title']),None)
+            if art and '花式' in title:
+                if '基本型' in title and any('基本型頒獎' in norm(p) for p in art.get('pages',[])):
+                    source=art['url'];basis='官方花式賽程列基本型比賽及頒獎'
+                elif '(長曲)' in clean(title) and any('長曲比賽' in norm(p) and '頒獎' in p for p in art.get('pages',[])):
+                    source=art['url'];basis='官方花式賽程最後競賽階段；最終名次採總成績';event['ranking_scope']='segment'
+                elif '並排綜合型' in title:
+                    technical=next((r['url'] for r in resources if r['sport_id']=='303' and r['label']=='技術手冊'),None)
+                    if technical:
+                        source=technical+'#page=12';basis='115 年技術手冊：基本型與自由型名次積分加總排名';event['ranking_scope']='aggregate'
+        # Award totals enumerate complete item catalogs, not heats. Require one
+        # scheduled stage for this exact item, with no qualifying/segment title.
+        if not source and not phase and not daily_team and not re.search(r'短曲|長曲|練習|檢查',title):
+            group=next((g for g in award_groups if norm(title).startswith(norm(g['title']))),None)
+            group_entries=[e for e in entries if group and norm(e['title']).startswith(norm(group['title']))]
+            same_item=[e for e in schedule if e['sport_id']==event['sport_id'] and item_title(e['title'])==item_title(title)]
+            if group and group['count']==len(group_entries)>0 and len(same_item)==1 and any(item_title(e['title'])==item_title(title) for e in group_entries):
+                source=SOURCES['awards'];basis='官方應頒獎牌項目數與完整項目清單相符，本項僅列一個競賽階段'
+        if source:
+            event.update(medal_event=True,medal_basis=basis,medal_source=source)
+            if not phase and event.get('ranking_scope')!='segment':event['phase']='獎牌賽'
+        if event.get('medal_event') and not daily_team:
+            # A single-round medal item has no qualification round to wait for.
+            event['direct_final']=not any(other['sport_id']==event['sport_id'] and item_title(other['title'])==item_title(title) and other['phase'] in ('預賽','複賽','準決賽') for other in schedule)
 
 def parse_entry(doc,pid,sid,sport,url):
     event=options(doc,'PID').get(pid,'');names=[];appearances=[]
     tables=list(table_rows(doc,['姓名','日期']))
     published=any(cells(row) and clean(cells(row)[0]) and not re.search(r'查無|尚未|無資料',clean(cells(row)[0])) for t in tables for row in t.xpath('.//tr[td]'))
     for t in tables:
-        labels=t.getparent().xpath('./span/text()')
+        labels=t.getparent().xpath('./span')
         if not any(CITY in clean(label) for label in labels):continue
         for row in t.xpath('.//tr[td]'):
             c=cells(row)
@@ -225,18 +321,30 @@ def parse_entry(doc,pid,sid,sport,url):
                 for a in row.xpath('.//a[contains(@href,"InstantScore.php")]'):
                     fid=parse_qs(urlsplit(a.get('href')).query).get('FID',[None])[0]
                     if fid:appearances.append({'name':name,'fid':fid,'text':clean(a)})
-    return {'pid':pid,'sport_id':sid,'sport':sport,'title':sport+event,'names':names,'appearances':appearances,'roster_published':bool(published),'source':url}
+    group=doc.xpath('//select[@name="PID"]//option[@value=$pid]/ancestor::optgroup[1]/@label',pid=pid)
+    return {'pid':pid,'sport_id':sid,'sport':sport,'title':sport+event,'group':clean(group[0]) if group else '', 'names':names,'appearances':appearances,'roster_published':bool(published),'source':url}
+
+def reconcile_entry_groups(entries,registrations):
+    """Some unpublished entry pages repeat the entire sport's registration list."""
+    groups={}
+    for row in registrations:groups.setdefault((row['sport_id'],norm(row['name'])),set()).add(norm(row['group']))
+    for entry in entries:
+        group=norm(entry.get('group'))
+        if not group:continue
+        original=entry['names'];appeared={a['name'] for a in entry['appearances']}
+        entry['names']=[name for name in original if name in appeared or not groups.get((entry['sport_id'],norm(name))) or any(g.startswith(group) or group.startswith(g) for g in groups[(entry['sport_id'],norm(name))])]
+        if entry['names']!=original:entry['roster_note']='依官方組別報名名單排除跨組名單；本輪出場紀錄優先。'
 
 def parse_score(doc,event,url):
     """Return confirmed Kaohsiung rows and an explicit report coverage flag."""
-    records=[]; recognized=False
+    records=[]; recognized=False; incomplete=False
     for t in table_rows(doc,['序']):
-        heads=[clean(h) for h in t.xpath('.//th')]
+        heads,body=score_table(t)
         # Team / head-to-head report: the two participants are separated by 對.
         if '勝隊' in heads or '勝方' in heads:
             recognized=True
-            for row in t.xpath('.//tr[td]'):
-                c=cells(row);v=[clean(x) for x in c]
+            for c in body:
+                v=[clean(x) for x in c]
                 sep=next((i for i,x in enumerate(v) if x=='對'),None)
                 if sep is None or sep<1 or sep+3>=len(c):continue
                 left,right=sep-1,sep+1
@@ -246,6 +354,9 @@ def parse_score(doc,event,url):
                 winner=v[sep+2];score=v[sep+3];note=v[-1] if heads[-1]=='備註' else ''
                 names=name_lines(c[ix]);tm=next((x for x in v[:left] if re.fullmatch(r'\d{1,2}:\d{2}',x)),event['time'])
                 rec={**event,'id':key(event['id'],'match',v[2] if len(v)>2 else v[0]),'match_no':v[2],'time':tm,'time_scope':'match','names':names,'names_basis':'report','opponent':opponent,'score':score,'score_order':'高雄在前' if ix==left else '高雄在後','note':note,'round_rank':None,'rank':None,'advancement':None,'result_state':'won' if CITY in winner else ('lost' if winner else ('draw' if score and re.fullmatch(r'(\d+)[:：]\1',score) else 'pending')), 'source':url}
+                stage=placement_stage(note)
+                if stage in ('決賽','銅牌賽'):
+                    rec.update(phase=stage,medal_event=True,medal_source=url,medal_basis='官方成績報告備註：'+note)
                 records.append(rec)
         elif any('選手' in x for x in heads) and any('比賽單位' in x or x=='單位' for x in heads):
             recognized=True
@@ -254,17 +365,25 @@ def parse_score(doc,event,url):
             ni=next(i for i,h in enumerate(heads) if '選手' in h)
             rank_indices=[i for i,h in enumerate(heads) if '名次' in h]
             final_advance=next((i for i,h in enumerate(heads) if '晉級決賽' in h),None)
-            for row in t.xpath('.//tr[td]'):
-                c=cells(row);v=[clean(x) for x in c]
-                if len(v)!=len(heads) or v[unit]!=CITY:continue
-                rtext=v[rank_indices[0]] if rank_indices else ''
+            for c in body:
+                v=[clean(x) for x in c]
+                if len(v)!=len(heads):
+                    if any(CITY in x for x in v):incomplete=True
+                    continue
+                if norm(v[unit])!=norm(CITY):continue
+                names=name_lines(c[ni])
+                if not names:incomplete=True;continue
+                overall=next((i for i,h in enumerate(heads) if h in ('名次','決賽名次','總名次','總排名')),None)
+                ri=overall if overall is not None and v[overall] else (rank_indices[0] if rank_indices else None)
+                rtext=v[ri] if ri is not None else ''
                 rank=int(rtext) if rtext.isdigit() else None
                 advance='qualified' if final_advance is not None and v[final_advance].upper() in ('V','Y','Q','✓','✔','晉級') else ('not_qualified' if final_advance is not None and v[final_advance] in ('未晉級','不晉級','淘汰') else None)
-                si=next((i for i,h in enumerate(heads) if h.endswith('成績') and v[i]),hmap.get('成績'))
+                si=next((i for i,h in enumerate(heads) if (h.endswith('成績') or h in ('Total','總分','總成績')) and v[i]),hmap.get('成績'))
                 score=v[si] if si is not None else ''
                 tm=v[hmap['時間']] if '時間' in hmap and re.fullmatch(r'\d{1,2}:\d{2}',v[hmap['時間']]) else event['time']
-                records.append({**event,'id':key(event['id'],'individual',v[ni]),'time':tm,'time_scope':'match','names':name_lines(c[ni]),'names_basis':'report','opponent':'','score':score,'note':v[hmap['備註']] if '備註' in hmap else '', 'round_rank':rank, 'rank':rank if event['phase']=='決賽' else None,'advancement':advance,'result_state':'result' if score or rank else 'pending','source':url})
-    return records,recognized
+                final_rank=rank if (event['phase']=='決賽' or event.get('medal_event')) and event.get('ranking_scope')!='segment' and ri==overall else None
+                records.append({**event,'id':key(event['id'],'individual',v[ni]),'time':tm,'time_scope':'event','names':names,'names_basis':'report','opponent':'','score':score,'note':v[hmap['備註']] if '備註' in hmap else '', 'round_rank':rank,'round_rank_text':rtext, 'rank':final_rank,'rank_source':url if final_rank else None,'advancement':advance,'result_state':'result' if score or rtext else 'pending','source':url})
+    return records,recognized and not incomplete
 
 def collect_team_outcomes(doc):
     outcomes={}
@@ -297,7 +416,7 @@ def parse_football_bracket(pages,source):
                 rows.append({'match_no':no,'date':day,'time':h.zfill(2)+':'+mi,'left':slot(left),'right':slot(right),'gender':'女子組' if gender=='女生' else '男子組','note':note,'source':source})
             elif rows and re.fullmatch(r'[一二三四五六七八九十、,季殿冠亞名軍]+',line):rows[-1]['note']=line
     for row in rows:
-        row['phase']='決賽' if '冠' in row['note'] else ('名次賽' if row['note'] else '')
+        row['phase']=placement_stage(row['note']) or ('名次賽' if row['note'] else '')
     for final in [r for r in rows if r['phase']=='決賽']:
         for slot in (final['left'],final['right']):
             if 'match' in slot:
@@ -316,6 +435,7 @@ def add_football_bracket(records,entries,schedule,report_docs,bracket):
         old=next((r for r in records if r['sport_id']=='216' and r.get('match_no')==match['match_no'] and gender in r['title']),None)
         if old:
             old['phase']=match['phase'];old['bracket_source']=match['source']
+            if match['phase'] in ('決賽','銅牌賽'):old.update(medal_event=True,medal_source=match['source'],medal_basis='官方對戰表：'+match['note'])
             if match['phase']=='準決賽' and old['result_state']=='won':
                 old['advancement']='qualified';old['advancement_basis']='依官方對戰表與已公告勝隊判定'
             continue
@@ -326,7 +446,7 @@ def add_football_bracket(records,entries,schedule,report_docs,bracket):
         if CITY not in (left,right):continue
         entry=next((e for e in entries if e['pid']==pid),None)
         names=entry['names'] if entry else []
-        records.append({'id':key('football-bracket',gender,match['match_no']),'sport_id':'216','sport':'五人制足球','pid':pid,'fid':None,'match_no':match['match_no'],'date':match['date'],'time':match['time'],'time_scope':'match','title':'五人制足球'+gender+'團體賽','phase':match['phase'],'names':names,'names_basis':'team_entry','opponent':right if left==CITY else left,'score':'','note':match['note'],'rank':None,'round_rank':None,'advancement':'qualified' if match['phase']=='決賽' else None,'advancement_basis':'依官方對戰表與已公告勝隊判定','result_state':'pending','source':match['source'],'links':[],'bracket_source':match['source']})
+        records.append({'id':key('football-bracket',gender,match['match_no']),'sport_id':'216','sport':'五人制足球','pid':pid,'fid':None,'match_no':match['match_no'],'date':match['date'],'time':match['time'],'time_scope':'match','title':'五人制足球'+gender+'團體賽','phase':match['phase'],'medal_event':match['phase'] in ('決賽','銅牌賽'),'medal_source':match['source'],'medal_basis':'官方對戰表：'+match['note'],'names':names,'names_basis':'team_entry','opponent':right if left==CITY else left,'score':'','note':match['note'],'rank':None,'round_rank':None,'advancement':'qualified' if match['phase']=='決賽' else None,'advancement_basis':'依官方對戰表與已公告勝隊判定','result_state':'pending','source':match['source'],'links':[],'bracket_source':match['source']})
     return records
 
 def join_events(schedule, entries, report_docs):
@@ -335,23 +455,81 @@ def join_events(schedule, entries, report_docs):
     for event in schedule:
         entry=by_pid.get(event.get('pid'))
         if entry is None:
-            title=norm(re.sub(r'[（(][^()（）]*[)）]','',event['title']))
-            matches=[e for e in entries if e['sport_id']==event['sport_id'] and norm(e['title'])==title]
+            title=item_title(event['title'])
+            matches=[e for e in entries if e['sport_id']==event['sport_id'] and item_title(e['title'])==title]
             if len(matches)==1:entry=matches[0];event['pid']=entry['pid']
+        parsed=[]
         report=report_docs.get(event.get('report'))
         if report is not None:
             parsed,recognized=parse_score(report,event,event['report'])
+            if entry and is_team_event(event):
+                for record in parsed:
+                    record['registered_names']=entry['names'];record['registration_source']=entry['source']
+                    if not record['names']:
+                        record['names']=entry['names'];record['names_basis']='team_entry'
+            records.extend(parsed)
             if recognized:
-                records.extend(parsed);continue
+                # Entry-page appearances can be published before a report row.
+                listed={n for r in parsed for n in r['names']}
+                missing=[a['name'] for a in (entry or {}).get('appearances',[]) if a['fid']==event.get('fid') and a['name'] not in listed]
+                if missing and not is_team_event(event):
+                    extra={**event,'id':key(event['id'],'entry-appearance',','.join(missing)),'names':list(dict.fromkeys(missing)),'names_basis':'entry_round','time_scope':'event','score':'','rank':None,'round_rank':None,'advancement':None,'result_state':'pending','note':'官方本輪名單已列出；成績報告尚未列齊。','source':entry['source']}
+                    records.append(extra);parsed.append(extra)
+                if parsed and entry and not is_team_event(event) and (event['phase'] in ('','預賽','獎牌賽') or event.get('direct_final')):
+                    missing=[n for n in entry['names'] if not any(n in r['names'] for r in parsed)]
+                    if missing:parsed[0].update(registered_names=missing,registration_source=entry['source'])
+                continue
             unrecognized.append(event['report'])
         if not entry or not entry['names']:continue
         # A team day's first start is never a Kaohsiung match time.
         team=event['sport_id']=='216' or '曲棍球' in event['title']
-        final=event['phase'] in ('決賽','準決賽','複賽')
+        final=event['phase'] in ('決賽','準決賽','複賽','銅牌賽') and not event.get('direct_final')
         known=[a['name'] for a in entry['appearances'] if event.get('fid') and a['fid']==event['fid']]
-        confirmed_final=event['phase']=='決賽' and bool(known)
-        records.append({**event,'names':list(dict.fromkeys(known)) if known else entry['names'],'names_basis':'entry_round' if known else ('team_entry' if team else 'registration'), 'time':None if team else event['time'],'session_time':event['time'],'time_scope':'session' if team else 'event','opponent':'','score':'','note':'','rank':None,'round_rank':None,'advancement':'qualified' if confirmed_final else None,'result_state':'conditional' if final and not known else 'pending','source':entry['source']})
+        confirmed_final=event['phase']=='決賽' and bool(known) and not event.get('direct_final')
+        names=list(dict.fromkeys(known)) if known else entry['names']
+        names=[n for n in names if not any(n in r['names'] for r in parsed)]
+        if names:records.append({**event,'id':key(event['id'],'unparsed') if parsed else event['id'],'names':names,'names_basis':'entry_round' if known else ('team_entry' if team else 'registration'), 'time':None if team else event['time'],'session_time':event['time'],'time_scope':'session' if team else 'event','opponent':'','score':'','note':'','rank':None,'round_rank':None,'advancement':'qualified' if confirmed_final else None,'result_state':'conditional' if final and not known else 'pending','source':entry['source']})
     return records,unrecognized
+
+def merge_pdf_events(records,pdf_events):
+    for event in pdf_events:
+        # Sharing a time and one athlete does not make two disciplines identical.
+        same=next((r for r in records if r['sport_id']==event['sport_id'] and r['date']==event['date'] and r.get('time')==event['time'] and item_title(r['title'])==item_title(event['title']) and r.get('phase','')==event.get('phase','') and norm(r.get('opponent'))==norm(event.get('opponent')) and r.get('match_no','')==event.get('match_no','')),None)
+        if same:
+            if same.get('names_basis')=='report':
+                same['registered_names']=list(dict.fromkeys(same.get('registered_names',[])+event['names']))
+                same['registration_source']=event['source']
+            else:same['names']=list(dict.fromkeys(same['names']+event['names']))
+        else:records.append(event)
+
+def attach_final_results(records,finals):
+    for event in records:
+        if not (event.get('medal_event') or event['phase']=='決賽') or event.get('ranking_scope')=='segment':continue
+        matched=[f for f in finals if f['sport_id']==event['sport_id'] and f['date']==event['date'] and item_title(f['title'])==item_title(event['title']) and set(f['names'])&set(event['names'])]
+        if len(matched)==1:
+            final=matched[0]
+            # Individual placeholder lists may contain several different ranks.
+            if not is_team_event(event) and set(event['names'])!=set(final['names']):continue
+            event.update(rank=final['rank'],rank_source=final['source'],result_state='result',final_id=final['id'])
+            if final.get('score') and not event.get('score'):event['score']=final['score']
+
+def annotate_hockey_matches(records,documents):
+    """A team-day award link is not evidence that every match is a final."""
+    doc=next((d for d in documents if d['sport_id']=='303' and '曲棍球' in d['title']),None)
+    if not doc:return
+    day=None
+    for page,text in enumerate(doc.get('pages',[]),1):
+        for raw in text.splitlines():
+            line=clean(raw);compact=re.sub(r'\s+','',line)
+            dm=re.search(r'(\d+)月(\d+)日',compact)
+            if dm:day=date_iso(dm.group(1)+'/'+dm.group(2))
+            match=re.search(r'\b60\s+([男女]子[長短]桿)\s+(\d+)\b',line)
+            phase=placement_stage(line)
+            if not day or not match or phase not in ('決賽','銅牌賽'):continue
+            category,no=match.groups();gender='女子組' if category.startswith('女') else '男子組';stick='短桿' if '短桿' in category else '長桿'
+            for event in records:
+                if event['sport_id']=='303' and event['date']==day and event.get('match_no')==no and gender in event['title'] and stick in event['title']:
+                    event.update(phase=phase,medal_event=True,medal_source=doc['url']+'#page='+str(page),medal_basis='官方曲棍球對戰表列'+phase)
 
 def load_documents(resources,fetcher,previous=None):
     result=[]
@@ -377,7 +555,7 @@ def attach_athletes(registrations,entries,records,finals,sport_map):
     for e in entries:
         for n in e['names']:add(e['sport_id'],n,source=e['source'])['entry_ids'].append(e['pid'])
     for e in records:
-        for n in e['names']:add(e['sport_id'],n,source=e['source'])['event_ids'].append(e['id'])
+        for n in dict.fromkeys(e['names']+e.get('registered_names',[])):add(e['sport_id'],n,source=e['source'])['event_ids'].append(e['id'])
     for f in finals:
         for n in f['names']:add(f['sport_id'],n,f['group'],f['source'])['final_ids'].append(f['id'])
     return sorted(athletes.values(),key=lambda a:(a['sport_id'],a['name']))
@@ -394,7 +572,8 @@ def validate_snapshot(data):
         if not event['names']:raise ValueError('Kaohsiung event without names')
         datetime.fromisoformat(event['date'])
         if event.get('time') and not re.fullmatch(r'\d{2}:\d{2}',event['time']):raise ValueError('Invalid event time')
-        if event.get('rank') and event['phase']!='決賽':raise ValueError('A preliminary rank was treated as a final rank')
+        if event.get('rank') and not (event['phase']=='決賽' or event.get('medal_event') and event.get('medal_source')):raise ValueError('A preliminary rank was treated as a final rank')
+        if event.get('rank') and event.get('ranking_scope')=='segment':raise ValueError('A segment rank was treated as the overall result')
         if event.get('advancement')=='qualified' and not (event.get('advancement_basis') or event['names_basis'] in ('entry_round','report')):raise ValueError('Unsubstantiated advancement')
     return True
 
@@ -415,6 +594,7 @@ def run(args):
     sport_map=options(finals_doc,'LID')
     if len(sport_map)!=32:raise ValueError('Unexpected official sports catalog; review before publishing')
     finals=parse_finals(final_rows,sport_map)
+    award_groups=parse_award_groups(fetcher.get(SOURCES['awards']))
     if refresh_reference:
         print('Reading all Kaohsiung registration pages and all sports references',flush=True)
         roster_doc,roster_rows=paginated(fetcher,SOURCES['roster'],['姓名','職稱','組別'])
@@ -422,7 +602,7 @@ def run(args):
         plans=parse_plan(fetcher.get(SOURCES['plan']),sport_map)
         resources=parse_catalog(fetcher.get(SOURCES['catalog']),sport_map)
         docs=load_documents(resources,fetcher)
-        reference_checked_at=now.isoformat()
+        reference_checked_at=min(fetcher.observed[u] for u in (SOURCES['roster'],SOURCES['plan'],SOURCES['catalog'])) if args.offline else now.isoformat()
     else:
         registrations=previous['registrations'];plans=previous['plans'];resources=previous['resources'];docs=previous.get('documents',[]);reference_checked_at=previous['meta']['reference_checked_at']
     instant=fetcher.get(SOURCES['instant'])
@@ -449,16 +629,18 @@ def run(args):
         for pid,label in options(entry_root_docs[entry_url],'PID').items():
             url=entry_url+'&PID='+pid
             entry_specs.append((sid,pid,url))
-            by_title=any(e['sport_id']==sid and norm(re.sub(r'[（(][^()（）]*[)）]','',e['title']))==norm(sport_map[sid]+label) for e in nearby)
+            by_title=any(e['sport_id']==sid and item_title(e['title'])==item_title(sport_map[sid]+label) for e in nearby)
             entry_ages[url]=0 if pid in active_pids or by_title else daily_age
     entry_pages=fetcher.batch([url for _,_,url in entry_specs],entry_ages)
     if len(entry_pages)!=len(entry_specs):raise ValueError('Event entry list fetch was incomplete')
     entries=[parse_entry(entry_pages[url],pid,sid,sport_map[sid],url) for sid,pid,url in entry_specs]
+    reconcile_entry_groups(entries,registrations)
     report_ages={e['report']:0 if near_start<=e['date']<=near_end else daily_age for e in schedule if e['report']}
     reports=fetcher.batch(report_ages,report_ages)
     if fetcher.errors:raise ValueError('A source could not be fetched; keeping the previous complete snapshot')
-    records,unrecognized=join_events(schedule,entries,reports)
     supplements=json.loads((args.output/'documents.json').read_text()) if (args.output/'documents.json').exists() else {'documents':[]}
+    annotate_medal_sessions(schedule,supplements.get('documents',[]),resources,award_groups,entries)
+    records,unrecognized=join_events(schedule,entries,reports)
     football_doc=next((d for d in supplements['documents'] if '38-3' in d.get('title','') and d['sport_id']=='216'),None)
     if football_doc:
         bracket=parse_football_bracket(football_doc['pages'],football_doc['url'])
@@ -467,9 +649,15 @@ def run(args):
         records=add_football_bracket(records,entries,schedule,reports,bracket)
     from pdf_events import extract_pdf_events
     pdf_events=extract_pdf_events(supplements.get('documents',[]),registrations,plans)
-    for event in pdf_events:
-        duplicate=any(r['sport_id']==event['sport_id'] and r['date']==event['date'] and r.get('time')==event['time'] and set(r['names'])&set(event['names']) for r in records)
-        if not duplicate:records.append(event)
+    merge_pdf_events(records,pdf_events)
+    # Whitespace/compatibility variants must not create a second athlete identity.
+    canonical={(r['sport_id'],norm(r['name'])):r['name'] for r in registrations}
+    for collection in (entries,records,finals):
+        for row in collection:
+            for field in ('names','registered_names'):
+                if field in row:row[field]=list(dict.fromkeys(canonical.get((row['sport_id'],norm(n)),n) for n in row[field]))
+    annotate_hockey_matches(records,supplements.get('documents',[]))
+    attach_final_results(records,finals)
     records.sort(key=lambda r:(r['date'],r.get('time') or '99:99',r['sport_id'],r['title'],r['id']))
     athletes=attach_athletes(registrations,entries,records,finals,sport_map)
     data={'schema_version':1,'sports':[{'id':sid,'name':name} for sid,name in sport_map.items()],'registrations':registrations,'athletes':athletes,'entries':entries,'events':records,'scheduled_sessions':schedule,'finals':finals,'plans':plans,'resources':resources,'documents':docs,
